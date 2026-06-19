@@ -17,6 +17,23 @@ const configuredWebExternalHost = process.env.WEB_EXTERNAL_HOST;
 const configuredDashboardExternalHost =
   process.env.BOTMUX_DASHBOARD_EXTERNAL_HOST ?? process.env.WEB_EXTERNAL_HOST;
 
+export interface LinearRepositoryConfig {
+  key: string;
+  hostname: string;
+  repositoryFullName: string;
+  workingDir: string;
+  displayName?: string;
+  branch?: string;
+}
+
+export interface LinearAgentRosterEntry {
+  key: string;
+  channelIdentity: string;
+  runtimeBotId: string;
+  displayName?: string;
+  mentionUrl?: string;
+}
+
 export function getWebExternalHost(): string {
   return configuredWebExternalHost ?? getLocalIp();
 }
@@ -35,6 +52,45 @@ export function getDashboardExternalHost(): string {
  */
 function detectDefaultBackend(): Exclude<BackendType, 'herdr'> {
   return probeTmuxFunctional().ok ? 'tmux' : 'pty';
+}
+
+function readLinearRepositories(raw = process.env.LINEAR_REPOSITORIES_JSON): LinearRepositoryConfig[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is LinearRepositoryConfig => (
+      item
+      && typeof item === 'object'
+      && typeof item.key === 'string'
+      && typeof item.hostname === 'string'
+      && typeof item.repositoryFullName === 'string'
+      && typeof item.workingDir === 'string'
+      && (item.displayName === undefined || typeof item.displayName === 'string')
+      && (item.branch === undefined || typeof item.branch === 'string')
+    ));
+  } catch {
+    return [];
+  }
+}
+
+function readLinearAgentRoster(raw = process.env.LINEAR_AGENT_ROSTER_JSON): LinearAgentRosterEntry[] {
+  if (!raw?.trim()) return [];
+  try {
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((item): item is LinearAgentRosterEntry => (
+      item
+      && typeof item === 'object'
+      && typeof item.key === 'string'
+      && typeof item.channelIdentity === 'string'
+      && typeof item.runtimeBotId === 'string'
+      && (item.displayName === undefined || typeof item.displayName === 'string')
+      && (item.mentionUrl === undefined || typeof item.mentionUrl === 'string')
+    ));
+  } catch {
+    return [];
+  }
 }
 
 // Computed once: the packaged fallback data dir. The effective dir is read
@@ -115,6 +171,32 @@ export const config = {
      *  permanently takes precedence over this env var（UI 接管后改 env 不再生效；
      *  要回到 env 控制需删掉 config.json 里的 dashboard.publicReadOnly）. */
     publicReadOnly: (process.env.BOTMUX_DASHBOARD_PUBLIC_READONLY ?? 'true').toLowerCase() !== 'false',
+  },
+  linear: {
+    /** Explicit public, read-only base URL for Linear AgentSession externalUrls.
+     *  Never inferred from dashboard/web externalHost because those may be LAN,
+     *  localhost, or token-bearing management URLs. */
+    get publicBaseUrl() { return process.env.LINEAR_PUBLIC_BASE_URL ?? ''; },
+    /** Optional public base URL for the read-only terminal proxy (`/s/{sessionId}`).
+     *  Kept separate from publicBaseUrl because dashboard and terminal proxy may
+     *  be exposed by different tunnels/ports. */
+    get publicTerminalBaseUrl() { return process.env.LINEAR_PUBLIC_TERMINAL_BASE_URL ?? ''; },
+    get repositories() { return readLinearRepositories(); },
+    get agents() { return readLinearAgentRoster(); },
+    get issueSideEffects() {
+      return {
+        statusOnStartId: process.env.LINEAR_STATUS_ON_START_ID,
+        statusOnDoneId: process.env.LINEAR_STATUS_ON_DONE_ID,
+        statusOnErrorId: process.env.LINEAR_STATUS_ON_ERROR_ID,
+        delegateSelfId: process.env.LINEAR_DELEGATE_SELF_ID,
+        commentMirrorEnabled: (process.env.LINEAR_COMMENT_MIRROR_ENABLED ?? '').toLowerCase() === 'true',
+      };
+    },
+    get agentPlan() {
+      return {
+        enabled: (process.env.LINEAR_AGENT_PLAN_ENABLED ?? '').toLowerCase() === 'true',
+      };
+    },
   },
   screenAnalyzer: {
     enabled: (process.env.SCREEN_ANALYZER_ENABLED ?? '').toLowerCase() === 'true',

@@ -23,7 +23,7 @@ import type { BackendType } from '../adapters/backend/types.js';
 import type { LarkAttachment, LarkMention, ScheduledTask } from '../types.js';
 import type { MessageResource } from '../im/lark/message-parser.js';
 import type { ResolvedSender } from '../im/lark/identity-cache.js';
-import { sessionKey, sessionAnchorId } from './types.js';
+import { activeSessionKey, channelAnchorId, sessionKey, sessionAnchorId } from './types.js';
 import type { DaemonSession } from './types.js';
 import { markSessionActivity } from './session-activity.js';
 import { usageLimitStateKey } from '../utils/cli-usage-limit.js';
@@ -727,11 +727,18 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
     }
 
     const larkAppId = session.larkAppId ?? getAllBots()[0]?.config.larkAppId ?? '';
+    const channel = session.channel;
+    const channelIdentity = session.channelIdentity;
+    const runtimeBotId = session.runtimeBotId;
     const ds: DaemonSession = {
       session,
       worker: null,
       workerPort: null,
       workerToken: null,
+      channel,
+      channelIdentity,
+      runtimeBotId,
+      linear: session.linear,
       larkAppId,
       chatId: session.chatId,
       chatType: session.chatType ?? 'group',
@@ -763,11 +770,11 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // patch a streaming card. Cleared on the first real CLI input.
       suppressRecoveryCard: true,
     };
-    const anchor = sessionAnchorId(ds);
+    const anchor = channelAnchorId(ds);
     messageQueue.ensureQueue(anchor);
     if (ds.usageLimit) restoreUsageLimitRuntimeState(ds);
     // Same-key collision guard — see adopt-branch comment above.
-    await setActiveSessionSafe(activeSessions, sessionKey(anchor, larkAppId), ds);
+    await setActiveSessionSafe(activeSessions, activeSessionKey(ds), ds);
 
     logger.debug(`Registered session ${session.sessionId} (scope: ${scope}, anchor: ${anchor})`);
   }
@@ -803,6 +810,10 @@ export async function restoreActiveSessions(activeSessions: Map<string, DaemonSe
       // (forkWorker(resume=true) clears the marker once the worker is back).
       if (ds.session.suspendedColdResume) {
         logger.info(`[${tag}] ${backendType} session was cap-suspended — keeping active for lazy cold-resume`);
+        continue;
+      }
+      if (ds.channel === 'linear' && ds.session.cliSessionId) {
+        logger.info(`[${tag}] Linear session backing ${backendType} "${backendName}" is missing — keeping active for Codex cold-resume`);
         continue;
       }
       // 'missing' is ambiguous: it means EITHER this one pane is gone while the

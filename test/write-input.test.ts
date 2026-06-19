@@ -924,6 +924,7 @@ describe('codex writeInput submission confirmation', () => {
     })).toEqual([
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
@@ -943,6 +944,7 @@ describe('codex writeInput submission confirmation', () => {
     })).toEqual([
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
@@ -960,6 +962,7 @@ describe('codex writeInput submission confirmation', () => {
     expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
       'resume',
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
@@ -978,6 +981,7 @@ describe('codex writeInput submission confirmation', () => {
       expect(adapter.buildArgs({ sessionId: 'custom-botmux-session', resume: true })).toEqual([
         'resume',
         '--dangerously-bypass-approvals-and-sandbox',
+        '--dangerously-bypass-hook-trust',
         '--no-alt-screen',
         '-c',
         'shell_environment_policy.set.BOTMUX_SESSION_ID="custom-botmux-session"',
@@ -1001,6 +1005,7 @@ describe('codex writeInput submission confirmation', () => {
 
     expect(adapter.buildArgs({ sessionId: 'botmux-session', resume: true })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',
@@ -1017,6 +1022,7 @@ describe('codex writeInput submission confirmation', () => {
       workingDir: '/repo/root',
     })).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="botmux-session"',

@@ -100,6 +100,9 @@ import {
   type WorkflowCommandResult,
 } from './im/lark/workflow-slash-command.js';
 import { workflowRunDetailUrl } from './im/lark/workflow-cards.js';
+import { feedLinearTurn, createLinearFeedState, type LinearFeedTurn } from './core/linear-channel.js';
+import { applyLinearIssueSideEffects, buildLinearSessionExternalUrls, createLinearActivityEmitter, createLinearGraphqlActivityClient, suppressStoppedLinearFinalOutput, type LinearGraphqlClient } from './core/linear-egress.js';
+import { resolveLinearOAuthAccessToken } from './core/linear-oauth.js';
 import {
   buildWorkflowStartingCard,
   buildWorkflowProgressCard,
@@ -157,6 +160,93 @@ import { createLarkAskCardDispatcher } from './im/lark/ask-card.js';
 
 const activeSessions = new Map<string, DaemonSession>();
 const workflowEventWatchers = new Map<string, WorkflowEventWatcher>();
+const linearFeedState = createLinearFeedState();
+
+async function linearActivityClientFor(ds: DaemonSession): Promise<LinearGraphqlClient | null> {
+  return linearActivityClientForIdentity({
+    organizationId: ds.linear?.organizationId,
+    channelIdentity: ds.channelIdentity,
+    sessionId: ds.session.sessionId,
+  });
+}
+
+async function linearActivityClientForIdentity(input: { organizationId?: string; channelIdentity?: string; sessionId?: string }): Promise<LinearGraphqlClient | null> {
+  const envToken = process.env.LINEAR_ACCESS_TOKEN;
+  if (envToken) return createLinearGraphqlActivityClient(envToken);
+  const clientId = process.env.LINEAR_CLIENT_ID;
+  const clientSecret = process.env.LINEAR_CLIENT_SECRET;
+  const organizationId = input.organizationId;
+  const channelIdentity = input.channelIdentity;
+  if (!clientId || !clientSecret || !organizationId || !channelIdentity) return null;
+  let token: string | null = null;
+  try {
+    token = await resolveLinearOAuthAccessToken({ organizationId, clientId, channelIdentity }, clientSecret);
+  } catch (err: any) {
+    logger.warn(`[${(input.sessionId ?? 'linear').substring(0, 8)}] Linear token refresh failed: ${err?.message ?? String(err)}`);
+    return null;
+  }
+  return token ? createLinearGraphqlActivityClient(token) : null;
+}
+
+function parseLinearFeedTurn(body: unknown): LinearFeedTurn | null {
+  const turn = body && typeof body === 'object' && !Array.isArray(body)
+    ? (body as { turn?: unknown }).turn
+    : null;
+  if (!turn || typeof turn !== 'object' || Array.isArray(turn)) return null;
+  const t = turn as Record<string, unknown>;
+  for (const k of ['organizationId', 'issueId', 'agentSessionId', 'channelIdentity', 'runtimeBotId', 'body']) {
+    if (typeof t[k] !== 'string') return null;
+  }
+  if (t.type !== 'created' && t.type !== 'prompted' && t.type !== 'stop') return null;
+  return turn as LinearFeedTurn;
+}
+
+ipcRoute('POST', '/api/linear/turn', async (req, res) => {
+  let body: unknown;
+  try {
+    body = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const turn = parseLinearFeedTurn(body);
+  if (!turn) return jsonRes(res, 400, { ok: false, error: 'bad_linear_turn' });
+
+  const result = await feedLinearTurn(turn, {
+    activeSessions,
+    state: linearFeedState,
+    currentCliVersion: getCurrentCliVersion,
+    forkWorker,
+    repositoryCandidates: config.linear.repositories,
+  });
+  if (!result.ok) return jsonRes(res, 400, result);
+
+  if (result.action === 'awaiting_input') {
+    const client = await linearActivityClientForIdentity({
+      organizationId: turn.organizationId,
+      channelIdentity: turn.channelIdentity,
+    });
+    if (client) {
+      await createLinearActivityEmitter(client).selectElicitation(turn.agentSessionId, result.control);
+    } else {
+      logger.warn(`[linear] repo_select elicitation skipped: missing Linear access token`);
+    }
+  }
+
+  if (result.action === 'queued') {
+    const ds = activeSessions.get(result.sessionKey);
+    const client = ds ? await linearActivityClientFor(ds) : null;
+    if (ds && client) {
+      const emitter = createLinearActivityEmitter(client);
+      await emitter.placeholderOnce(ds);
+      const externalUrls = buildLinearSessionExternalUrls(ds);
+      if (externalUrls.length) await emitter.externalUrls(ds, externalUrls);
+      await applyLinearIssueSideEffects(client, ds, 'start');
+    } else if (ds) {
+      logger.warn(`[${ds.session.sessionId.substring(0, 8)}] Linear placeholder skipped: missing Linear access token`);
+    }
+  }
+  return jsonRes(res, 200, result);
+});
 
 function sessionHasReplyThreadAlias(s: Pick<Session, 'scope' | 'replyThreadAliases'>, rootId: string): boolean {
   return s.scope === 'chat' && !!s.replyThreadAliases?.[rootId];
@@ -1843,6 +1933,40 @@ ipcRoute('POST', '/api/attention', async (req, res) => {
   publishAttentionPatch(ds);
   emitSessionLifecycleHook(ds, 'session.requires_attention', { reason: 'agent_request', kind, message: reason });
   return jsonRes(res, 200, { ok: true });
+});
+
+// ─── Linear status IPC route (agent-facing via `botmux linear-status`) ───────
+//
+// Used only from Linear-backed worker sessions. It lets the CLI publish a short
+// semantic status as a Linear thought without exposing raw terminal output.
+ipcRoute('POST', '/api/linear/status', async (req, res) => {
+  let raw: { sessionId?: unknown; body?: unknown; key?: unknown };
+  try {
+    raw = await readJsonBody(req);
+  } catch {
+    return jsonRes(res, 400, { ok: false, error: 'bad_json' });
+  }
+  const sessionId = typeof raw.sessionId === 'string' ? raw.sessionId : '';
+  if (!sessionId) return jsonRes(res, 400, { ok: false, error: 'missing_sessionId' });
+
+  let ds: DaemonSession | undefined;
+  for (const s of activeSessions.values()) {
+    if (s.session.sessionId === sessionId) { ds = s; break; }
+  }
+  if (!ds) return jsonRes(res, 404, { ok: false, error: 'session_not_found' });
+  if (ds.channel !== 'linear') return jsonRes(res, 400, { ok: false, error: 'not_linear_session' });
+
+  const body = typeof raw.body === 'string' ? raw.body.replace(/\s+/g, ' ').trim().slice(0, 500) : '';
+  if (!body) return jsonRes(res, 400, { ok: false, error: 'missing_body' });
+  const rawKey = typeof raw.key === 'string' ? raw.key.trim() : '';
+  const key = (rawKey || `manual:${Date.now().toString(36)}`)
+    .replace(/[^a-zA-Z0-9:_-]/g, '_')
+    .slice(0, 120);
+
+  const client = await linearActivityClientFor(ds);
+  if (!client) return jsonRes(res, 503, { ok: false, error: 'missing_linear_token' });
+  const result = await createLinearActivityEmitter(client).thought(ds, body, key);
+  return jsonRes(res, result.ok ? 200 : 502, result);
 });
 
 // ─── session-ready IPC route (internal: Claude-family 真就绪信号) ─────────────
@@ -3538,6 +3662,46 @@ export async function startDaemon(botIndex?: number): Promise<void> {
   // Initialise worker pool with daemon callbacks
   initWorkerPool({
     sessionReply,
+    async linearFinalOutput(ds, msg) {
+      if (suppressStoppedLinearFinalOutput(ds, msg)) {
+        logger.info(`[${ds.session.sessionId.substring(0, 8)}] Linear final_output suppressed for stopped turn ${msg.turnId}`);
+        return;
+      }
+      const client = await linearActivityClientFor(ds);
+      if (!client) {
+        logger.warn(`[${ds.session.sessionId.substring(0, 8)}] Linear final_output skipped: missing Linear access token`);
+        return;
+      }
+      const result = await createLinearActivityEmitter(client).finalOutput(ds, msg);
+      if (result.ok && result.action === 'delivered') {
+        await applyLinearIssueSideEffects(client, ds, 'done', msg.content);
+      }
+    },
+    async linearError(ds, message) {
+      const client = await linearActivityClientFor(ds);
+      if (!client) {
+        logger.warn(`[${ds.session.sessionId.substring(0, 8)}] Linear error activity skipped: missing Linear access token`);
+        return;
+      }
+      const result = await createLinearActivityEmitter(client).error(ds, message);
+      if (result.ok && result.action === 'delivered') {
+        await applyLinearIssueSideEffects(client, ds, 'error');
+      }
+    },
+    async linearUserNotify(ds, msg, turnKey) {
+      const client = await linearActivityClientFor(ds);
+      if (!client) {
+        logger.warn(`[${ds.session.sessionId.substring(0, 8)}] Linear user_notify activity skipped: missing Linear access token`);
+        return;
+      }
+      const emitter = createLinearActivityEmitter(client);
+      const result = msg.severity === 'error'
+        ? await emitter.error(ds, msg.message, turnKey)
+        : await emitter.thought(ds, msg.message, turnKey);
+      if (msg.severity === 'error' && result.ok && result.action === 'delivered') {
+        await applyLinearIssueSideEffects(client, ds, 'error');
+      }
+    },
     getSessionWorkingDir,
     getActiveCount,
     closeSession(ds: DaemonSession) {

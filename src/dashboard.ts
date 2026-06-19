@@ -1,4 +1,5 @@
 // src/dashboard.ts
+import { config as dotenvConfig } from 'dotenv';
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { createServer as createTcpServer } from 'node:net';
 import {
@@ -24,6 +25,7 @@ import { handleDashboardTriggerApi } from './dashboard/trigger-api.js';
 import { handleConnectorApi } from './dashboard/connector-api.js';
 import { redactGroupsForPublic, redactSchedulesForPublic } from './dashboard/public-redact.js';
 import { handleWebhookRoute } from './dashboard/webhook-routes.js';
+import { handleLinearDashboardRoute } from './dashboard/linear-routes.js';
 import { handleFederationApi } from './dashboard/federation-api.js';
 import { handleFederationSpokeApi, syncAllMemberships, type TeamSessionRowLike } from './dashboard/federation-spoke-api.js';
 import { getRunsDir } from './workflows/runs-dir.js';
@@ -44,6 +46,9 @@ import { listTeamReports, readTeamBoard, setTeamBoardEntry } from './services/te
 import type { CliId } from './adapters/cli/types.js';
 import type { ConnectorDefinition } from './services/connector-store.js';
 import { hd2dAssetPath, hd2dStatus, startHd2dDownload } from './dashboard/hd2d-assets.js';
+
+const globalEnv = join(homedir(), '.botmux', '.env');
+dotenvConfig({ path: existsSync(globalEnv) ? globalEnv : '.env' });
 
 const SECRET_PATH = join(homedir(), '.botmux', '.dashboard-secret');
 const TOKEN_PATH = join(homedir(), '.botmux', '.dashboard-token');
@@ -453,6 +458,10 @@ const server = createServer(async (req, res) => {
     // Health probe (no auth) — for pm2
     if (url.pathname === '/__health') {
       return jsonRes(res, 200, { ok: true });
+    }
+
+    if (await handleLinearDashboardRoute(req, res, url, { proxyToDaemon })) {
+      return;
     }
 
     if (await handleWebhookRoute(req, res, url, {

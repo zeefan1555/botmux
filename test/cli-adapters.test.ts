@@ -271,6 +271,7 @@ describe('codex buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false });
     expect(adapter.resolvedBin).toBe('/usr/bin/codex');
     expect(args[0]).toBe('--dangerously-bypass-approvals-and-sandbox');
+    expect(args).toContain('--dangerously-bypass-hook-trust');
     expect(args).not.toContain('--codex-bin');
   });
 
@@ -297,6 +298,7 @@ describe('codex buildArgs', () => {
     const args2 = adapter.buildArgs({ sessionId: 'sess-4', resume: true });
     expect(args1).toEqual(args2);
     expect(args1).toContain('--dangerously-bypass-approvals-and-sandbox');
+    expect(args1).toContain('--dangerously-bypass-hook-trust');
     expect(args1).toContain('--no-alt-screen');
   });
 
@@ -310,6 +312,7 @@ describe('codex buildArgs', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root' });
     expect(args).toEqual([
       '--dangerously-bypass-approvals-and-sandbox',
+      '--dangerously-bypass-hook-trust',
       '--no-alt-screen',
       '-c',
       'shell_environment_policy.set.BOTMUX_SESSION_ID="sess-4"',
@@ -320,6 +323,7 @@ describe('codex buildArgs', () => {
 
   it('omits approval/sandbox bypass flag when disableCliBypass is true', () => {
     const args = adapter.buildArgs({ sessionId: 'sess-4', resume: false, workingDir: '/repo/root', disableCliBypass: true });
+    expect(args).not.toContain('--dangerously-bypass-hook-trust');
     expect(args).toEqual([
       '--no-alt-screen',
       '-c',
@@ -1084,10 +1088,10 @@ describe('buildResumeCommand', () => {
     expect(a.buildResumeCommand?.({ sessionId: unlikely })).toBeNull();
   });
 
-  it('codex emits `codex resume <cliSessionId>` when cliSessionId is known', () => {
+  it('codex emits hook-trusted resume command when cliSessionId is known', () => {
     const a = createCodexAdapter('/bin/codex');
     expect(a.buildResumeCommand?.({ sessionId: 'bm-x', cliSessionId: 'cdx-uuid-1' }))
-      .toBe('codex resume cdx-uuid-1');
+      .toBe('codex resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --no-alt-screen -c \'shell_environment_policy.set.BOTMUX_SESSION_ID="bm-x"\' \'cdx-uuid-1\'');
   });
 
   it('codex-app has no copy-paste resume command', () => {

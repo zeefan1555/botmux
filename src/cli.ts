@@ -25,7 +25,7 @@ import { homedir } from 'node:os';
 import { fileURLToPath } from 'node:url';
 import { createInterface } from 'node:readline';
 import { createRequire } from 'node:module';
-import { createHmac, randomBytes } from 'node:crypto';
+import { createHash, createHmac, randomBytes } from 'node:crypto';
 import { validateWorkingDir } from './core/working-dir.js';
 import { resolveSessionContext } from './core/session-marker.js';
 import { parseDispatchBotSpec, buildDispatchMessages, buildRepoPrimeText, buildReportContent, eligibleAutoMentionAliases, offTopicSubBotTopic, resolveReportTarget, resolveSendTarget } from './core/dispatch.js';
@@ -1536,6 +1536,13 @@ interface SessionData {
   cliId?: string;
   lastCliInput?: string;
   adoptedFrom?: AdoptedFromData;
+  channel?: 'lark' | 'linear';
+  channelIdentity?: string;
+  linear?: {
+    organizationId?: string;
+    issueId?: string;
+    agentSessionId?: string;
+  };
 }
 
 /**
@@ -2632,6 +2639,7 @@ botmux v${getVersion()} — IM ↔ AI 编程 CLI 桥接
                                        拉取当前会话的消息历史 (JSON)。默认按 session scope：话题/话题群 → 话题内，普通群 → 整群；
                                        thread 会话里可用 --scope ambient 读取 thread 外的群聊上下文
   quoted <message_id>                  拉取被引用的单条消息 (JSON)，message_id 取自 daemon 注入的引用提示行
+  linear-status [content]               Linear AgentSession 内发一条短状态 thought（支持 stdin / --content-file / --key）
 
 新建飞书群:
   create-group --bot <name> [--bot ...] [--name "群名"]
@@ -4762,6 +4770,66 @@ async function cmdSessionReady(): Promise<void> {
   process.exit(0);
 }
 
+async function cmdLinearStatus(rest: string[]): Promise<void> {
+  const contentFile = argValue(rest, '--content-file');
+  const bodyFromFile = contentFile ? readFileSync(contentFile, 'utf-8') : '';
+  const bodyFromArgs = positionals(rest).join(' ');
+  const bodyFromStdin = bodyFromFile || bodyFromArgs ? '' : await readStdin();
+  const body = (bodyFromFile || bodyFromArgs || bodyFromStdin).replace(/\s+/g, ' ').trim();
+  if (!body) {
+    console.error('用法: botmux linear-status [content] [--key <key>] [--session-id <id>] [--content-file <path>]');
+    process.exit(1);
+  }
+
+  const sessionId = argValue(rest, '--session-id') ?? findAncestorSessionContext()?.sessionId ?? process.env.BOTMUX_SESSION_ID;
+  if (!sessionId) {
+    console.error('无法推断 session-id。请在 Linear AgentSession 的 CLI 会话中运行，或传 --session-id <id>。');
+    process.exit(1);
+  }
+
+  const session = loadSessions().get(sessionId);
+  if (!session) {
+    console.error(`未找到 session ${sessionId}`);
+    process.exit(1);
+  }
+  const isLinear = process.env.BOTMUX_CHANNEL === 'linear' || session.channel === 'linear' || !!session.linear?.agentSessionId;
+  if (!isLinear) {
+    console.error('botmux linear-status 只能在 Linear channel 会话内使用；Lark/Feishu 请用 botmux send。');
+    process.exit(1);
+  }
+
+  const daemon = findDaemon(session.larkAppId) ?? findDaemon();
+  if (!daemon) {
+    console.error('未找到在线 daemon。请确认 botmux daemon 正在运行。');
+    process.exit(1);
+  }
+
+  const explicitKey = argValue(rest, '--key');
+  const key = explicitKey
+    ? explicitKey
+    : `manual:${Date.now().toString(36)}:${createHash('sha256').update(body).digest('hex').slice(0, 8)}`;
+
+  let res: Response;
+  try {
+    res = await fetch(`http://127.0.0.1:${daemon.ipcPort}/api/linear/status`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ sessionId, body, key }),
+    });
+  } catch (err: any) {
+    console.error(`Linear status 发送失败: ${err?.message ?? err}`);
+    process.exit(1);
+  }
+
+  let payload: any = {};
+  try { payload = await res.json(); } catch { /* ignore */ }
+  if (!res.ok || payload?.ok === false) {
+    console.error(`Linear status 发送失败: ${payload?.error ?? `HTTP ${res.status}`}`);
+    process.exit(1);
+  }
+  console.log(JSON.stringify({ ok: true, result: payload }, null, 2));
+}
+
 async function cmdBots(sub: string, rest: string[]): Promise<void> {
   process.env.SESSION_DATA_DIR ??= resolveDataDir();
 
@@ -5299,6 +5367,7 @@ switch (command) {
   case 'preset':   await cmdPreset(process.argv[3] ?? '', process.argv.slice(4)); break;
   case 'history':  await cmdHistory(process.argv.slice(3)); break;
   case 'quoted':   await cmdQuoted(process.argv.slice(3)); break;
+  case 'linear-status': await cmdLinearStatus(process.argv.slice(3)); break;
   case 'lang':     await cmdLang(process.argv.slice(3)); break;
   case 'voice':    await cmdVoiceSetup(process.argv.slice(3)); break;
   case 'thread':   {

@@ -11,7 +11,7 @@ import { fileURLToPath } from 'node:url';
 import { ensureSkills, ensureAskSkill, ensurePluginSkills, removeGlobalBotmuxSkills } from '../skills/installer.js';
 import { installHook } from '../adapters/hook-installer.js';
 import { hookCommandFor } from '../adapters/hook-command.js';
-import { randomBytes } from 'node:crypto';
+import { createHash, randomBytes } from 'node:crypto';
 import { config } from '../config.js';
 import * as sessionStore from '../services/session-store.js';
 import { persistStreamCardState, rememberLastCliInput } from './session-manager.js';
@@ -31,7 +31,7 @@ import { listDocSubscriptionsForSession, removeDocSubscription } from '../servic
 import { TmuxBackend } from '../adapters/backend/tmux-backend.js';
 import { HerdrBackend } from '../adapters/backend/herdr-backend.js';
 import { isSuspendableBackendType, getSessionPersistentBackendType, persistentSessionName, killPersistentSession } from './persistent-backend.js';
-import { getBot, getAllBots, resolveBrandLabel } from '../bot-registry.js';
+import { getBot, getAllBots, resolveBrandLabel, type BotConfig } from '../bot-registry.js';
 import { normalizeBrand } from '../im/lark/lark-hosts.js';
 import { dashboardEventBus } from './dashboard-events.js';
 import { composeRowFromActive, composeRowFromClosed } from './dashboard-rows.js';
@@ -41,7 +41,7 @@ import { emitSessionLifecycleHook, emitSessionStateTransitionHook } from '../ser
 import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsageForDaemonSession, reconcileUsageForDaemonSession } from '../services/usage-ledger.js';
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
-import { sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
+import { activeSessionKey, sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -55,6 +55,9 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 
 export interface WorkerPoolCallbacks {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
+  linearFinalOutput?: (ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>) => Promise<void> | void;
+  linearError?: (ds: DaemonSession, message: string, turnKey?: string) => Promise<void> | void;
+  linearUserNotify?: (ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'user_notify' }>, turnKey: string) => Promise<void> | void;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
@@ -62,6 +65,18 @@ export interface WorkerPoolCallbacks {
 }
 
 let callbacks: WorkerPoolCallbacks | undefined;
+
+export function linearActivitySourceForWorkerMessage(msg: WorkerToDaemon): 'response' | 'error' | null {
+  if (msg.type === 'final_output' && msg.content.trim()) return 'response';
+  if (msg.type === 'error') return 'error';
+  return null;
+}
+
+function linearUserNotifyTurnKey(msg: Extract<WorkerToDaemon, { type: 'user_notify' }>): string {
+  if (msg.turnId) return `user_notify:${msg.turnId}`;
+  const hash = createHash('sha256').update(msg.message).digest('hex').slice(0, 16);
+  return `user_notify:${hash}`;
+}
 
 /**
  * Initialise worker-pool callbacks. Must be called once before forkWorker().
@@ -176,6 +191,39 @@ function tag(ds: DaemonSession): string {
 
 function sessionCliId(ds: DaemonSession, botCfg: { cliId: CliId }): CliId {
   return ds.session.cliId ?? botCfg.cliId;
+}
+
+export function runtimeBotIdForSession(ds: DaemonSession): string {
+  return ds.runtimeBotId ?? ds.session.runtimeBotId ?? ds.larkAppId;
+}
+
+export function buildWorkerForkEnvForSession(
+  ds: DaemonSession,
+  botCfg: Pick<BotConfig, 'larkAppId' | 'larkAppSecret'>,
+  pathWithBotmux: string,
+): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {
+    ...process.env,
+    PATH: pathWithBotmux,
+    CLAUDECODE: undefined,
+    BOTMUX: '1',
+    SESSION_DATA_DIR: config.session.dataDir,
+    BOTMUX_CHANNEL: ds.channel ?? 'lark',
+    BOTMUX_CHANNEL_IDENTITY: ds.channelIdentity ?? ds.larkAppId,
+  };
+
+  if (ds.channel === 'linear') {
+    delete env.LARK_APP_ID;
+    delete env.LARK_APP_SECRET;
+    delete env.BOTMUX_LARK_APP_ID;
+    if (ds.linear?.issueId) env.BOTMUX_LINEAR_ISSUE_ID = ds.linear.issueId;
+    if (ds.linear?.agentSessionId) env.BOTMUX_LINEAR_AGENT_SESSION_ID = ds.linear.agentSessionId;
+  } else {
+    env.LARK_APP_ID = botCfg.larkAppId;
+    env.LARK_APP_SECRET = botCfg.larkAppSecret;
+  }
+
+  return env;
 }
 
 function loadKnownBotOpenIdsForApp(larkAppId: string): Set<string> {
@@ -1114,7 +1162,7 @@ export async function closeSession(
     } catch (err: any) {
       logger.warn(`[doc-comment] cleanup on close failed for ${sessionId.slice(0, 8)}: ${err?.message ?? err}`);
     }
-    activeSessionsRegistry?.delete(sessionKey(sessionAnchorId(ds), ds.larkAppId));
+    activeSessionsRegistry?.delete(activeSessionKey(ds));
     killedLive = true;
     if (!ds.exitEventEmitted) {
       ds.exitEventEmitted = true;
@@ -1373,7 +1421,7 @@ export async function transferSession(
   // Detach worker — TmuxBackend.kill() does NOT destroy the tmux session, so
   // the CLI process and its rolling jsonl continue running.
   kw(ds);
-  activeSessionsRegistry?.delete(sessionKey(oldAnchor, ds.larkAppId));
+  activeSessionsRegistry?.delete(activeSessionKey(ds));
 
   // Rewrite routing fields per the requested target scope.
   //   chat-scope:   routes by chatId; `targetRootMessageId` (e.g. an M1 id) is
@@ -1437,7 +1485,8 @@ export async function transferSession(
 
 export function forkWorker(ds: DaemonSession, prompt: string, resume = false): void {
   const cb = requireCallbacks();
-  const bot = getBot(ds.larkAppId);
+  const runtimeBotId = runtimeBotIdForSession(ds);
+  const bot = getBot(runtimeBotId);
   const botCfg = bot.config;
   // worker.js lives in the same directory as daemon.js (src/)
   const workerPath = join(__dirname, '..', 'worker.js');
@@ -1500,15 +1549,7 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
   const worker = fork(workerPath, [], {
     stdio: ['ignore', 'pipe', 'pipe', 'ipc'],
     cwd,
-    env: {
-      ...process.env,
-      PATH: pathWithBotmux,
-      CLAUDECODE: undefined,
-      BOTMUX: '1',  // Marker so user scripts/skills can detect a botmux-spawned CLI
-      SESSION_DATA_DIR: config.session.dataDir,
-      LARK_APP_ID: botCfg.larkAppId,
-      LARK_APP_SECRET: botCfg.larkAppSecret,
-    },
+    env: buildWorkerForkEnvForSession(ds, botCfg, pathWithBotmux),
   });
 
   // A fork-level failure (spawn ENOENT, etc.) emits 'error'; without a handler
@@ -1557,13 +1598,18 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
     cliSessionId: ds.session.cliSessionId,
     ownerOpenId: ds.ownerOpenId,
     webPort: ds.session.webPort,
-    larkAppId: botCfg.larkAppId,
-    larkAppSecret: botCfg.larkAppSecret,
-    brand: normalizeBrand(botCfg.brand),
-    botName: bot.botName,
-    botOpenId: bot.botOpenId,
+    channel: ds.channel ?? 'lark',
+    channelIdentity: ds.channelIdentity ?? ds.larkAppId,
+    runtimeBotId,
+    linearIssueId: ds.linear?.issueId,
+    linearAgentSessionId: ds.linear?.agentSessionId,
+    larkAppId: ds.channel === 'linear' ? undefined : botCfg.larkAppId,
+    larkAppSecret: ds.channel === 'linear' ? undefined : botCfg.larkAppSecret,
+    brand: ds.channel === 'linear' ? undefined : normalizeBrand(botCfg.brand),
+    botName: ds.channel === 'linear' ? undefined : bot.botName,
+    botOpenId: ds.channel === 'linear' ? undefined : bot.botOpenId,
     locale: botLocale(botCfg),
-    turnId: ds.currentReplyTarget?.turnId,
+    turnId: ds.channel === 'linear' ? ds.linear?.currentTurnId : ds.currentReplyTarget?.turnId,
   };
   worker.send(initMsg);
   ds.initConfig = initMsg;
@@ -1612,12 +1658,13 @@ export function forkWorker(ds: DaemonSession, prompt: string, resume = false): v
 function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
   const cb = requireCallbacks();
   const t = tag(ds);
+  const isLinear = ds.channel === 'linear';
   // Worker messages without a turn of their own (first streaming card, crash
   // notices) anchor to the session's current reply-target turn so a shared
   // fold-back topic keeps them in-thread instead of leaking top-level.
   const scopedReply = (content: string, msgType?: string, turnId?: string) =>
     cb.sessionReply(sessionAnchorId(ds), content, msgType, ds.larkAppId, fallbackTurnId(ds, turnId));
-  const bot = getBot(ds.larkAppId);
+  const bot = getBot(runtimeBotIdForSession(ds));
   const botCfg = bot.config;
   const loc = botLocale(botCfg);
 
@@ -1650,6 +1697,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             patch: { webPort: msg.port },
           },
         });
+        if (isLinear) break;
 
         // Bot opted out of the streaming card: the terminal is up and the
         // final answer will still arrive via `botmux send`; just don't post the
@@ -1883,6 +1931,7 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             recordUsageForDaemonSession(ds);
           }
         }
+        if (isLinear) break;
 
         // Bot opted out of the streaming card — dashboard SSE above already got
         // the status patch; just don't touch any Lark card.
@@ -2165,6 +2214,13 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
 
       case 'error': {
         logger.error(`[${t}] Worker error: ${msg.message}`);
+        if (isLinear) {
+          try {
+            await cb.linearError?.(ds, msg.message);
+          } catch (err: any) {
+            logger.warn(`[${t}] Linear error activity callback failed: ${err?.message ?? String(err)}`);
+          }
+        }
         break;
       }
 
@@ -2174,6 +2230,14 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
           reason: 'user_notify',
           message: msg.message,
         });
+        if (isLinear) {
+          try {
+            await cb.linearUserNotify?.(ds, msg, linearUserNotifyTurnKey(msg));
+          } catch (err: any) {
+            logger.warn(`[${t}] Linear user_notify callback failed: ${err?.message ?? String(err)}`);
+          }
+          break;
+        }
         try {
           await scopedReply(msg.message, 'text', msg.turnId);
         } catch (err: any) {
@@ -2194,6 +2258,16 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // Worker pops the turn off its queue right after emit, so it will
         // NOT re-send this payload on its own. Daemon owns retry on
         // transient Lark failures.
+        if (isLinear) {
+          try {
+            await cb.linearFinalOutput?.(ds, msg);
+          } catch (err: any) {
+            logger.warn(`[${t}] Linear final_output callback failed: ${err?.message ?? String(err)}`);
+          }
+          ds.lastBridgeEmittedUuid = msg.lastUuid;
+          logger.info(`[${t}] Linear final_output captured (${msg.content.length} chars); egress is handled outside Lark`);
+          break;
+        }
         deliverFinalOutput(ds, msg, t, 0);
         break;
       }
