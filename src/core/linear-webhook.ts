@@ -63,6 +63,7 @@ export function normalizeLinearAgentSessionEvent(
   const issue = objectAt(agentSession, 'issue');
   const issueId = stringAt(issue, 'id');
   if (!agentSessionId || !issueId) return null;
+  const project = objectAt(issue, 'project');
 
   const agentActivity = objectAt(payload, 'agentActivity') ?? objectAt(payload, 'activity') ?? objectAt(payload, 'data.agentActivity');
   const agentActivityId = stringAt(agentActivity, 'id');
@@ -103,6 +104,14 @@ export function normalizeLinearAgentSessionEvent(
       identifier: stringAt(issue, 'identifier'),
       title: stringAt(issue, 'title'),
       description: stringAt(issue, 'description'),
+      project: project
+        ? {
+          id: stringAt(project, 'id'),
+          name: stringAt(project, 'name'),
+          content: stringAt(project, 'content'),
+          description: stringAt(project, 'description'),
+        }
+        : undefined,
     },
     workingDir: opts.workingDir,
   };

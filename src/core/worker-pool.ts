@@ -42,6 +42,7 @@ import { anchorUsageForDaemonSession, recordOwnershipForDaemonSession, recordUsa
 import type { CliId } from '../adapters/cli/types.js';
 import type { DaemonToWorker, WorkerToDaemon, Session, DisplayMode } from '../types.js';
 import { activeSessionKey, sessionKey, sessionAnchorId, type DaemonSession } from './types.js';
+import type { LinearRunEvent } from './linear-run-status-projector.js';
 import { claimPendingResponseCard, COMPLETED_REACTION_EMOJI_TYPE, markPendingResponseCardPatchedIfCurrent, syncPendingResponseState } from './pending-response.js';
 import { buildTerminalUrl } from './terminal-url.js';
 import { usageLimitStateKey, type CliUsageLimitState } from '../utils/cli-usage-limit.js';
@@ -55,9 +56,7 @@ const WORKER_SIGKILL_BACKSTOP_MS = 7_000;
 
 export interface WorkerPoolCallbacks {
   sessionReply: (rootId: string, content: string, msgType?: string, larkAppId?: string, turnId?: string) => Promise<string>;
-  linearFinalOutput?: (ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'final_output' }>) => Promise<void> | void;
-  linearError?: (ds: DaemonSession, message: string, turnKey?: string) => Promise<void> | void;
-  linearUserNotify?: (ds: DaemonSession, msg: Extract<WorkerToDaemon, { type: 'user_notify' }>, turnKey: string) => Promise<void> | void;
+  linearRunEvent?: (ds: DaemonSession, event: LinearRunEvent) => Promise<unknown> | unknown;
   getSessionWorkingDir: (ds?: DaemonSession) => string;
   getActiveCount: () => number;
   /** Close a stale session (message withdrawn, etc.) */
@@ -1697,7 +1696,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
             patch: { webPort: msg.port },
           },
         });
-        if (isLinear) break;
+        if (isLinear) {
+          void Promise.resolve(cb.linearRunEvent?.(ds, { type: 'worker_ready' })).catch((err: any) => {
+            logger.warn(`[${t}] Linear worker_ready event failed: ${err?.message ?? String(err)}`);
+          });
+          break;
+        }
 
         // Bot opted out of the streaming card: the terminal is up and the
         // final answer will still arrive via `botmux send`; just don't post the
@@ -2216,9 +2220,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         logger.error(`[${t}] Worker error: ${msg.message}`);
         if (isLinear) {
           try {
-            await cb.linearError?.(ds, msg.message);
+            await cb.linearRunEvent?.(ds, { type: 'error', message: msg.message });
           } catch (err: any) {
-            logger.warn(`[${t}] Linear error activity callback failed: ${err?.message ?? String(err)}`);
+            logger.warn(`[${t}] Linear error event failed: ${err?.message ?? String(err)}`);
           }
         }
         break;
@@ -2232,9 +2236,12 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         });
         if (isLinear) {
           try {
-            await cb.linearUserNotify?.(ds, msg, linearUserNotifyTurnKey(msg));
+            const turnKey = linearUserNotifyTurnKey(msg);
+            await cb.linearRunEvent?.(ds, msg.severity === 'error'
+              ? { type: 'error', message: msg.message, turnKey }
+              : { type: 'status_update', body: msg.message, key: turnKey });
           } catch (err: any) {
-            logger.warn(`[${t}] Linear user_notify callback failed: ${err?.message ?? String(err)}`);
+            logger.warn(`[${t}] Linear user_notify event failed: ${err?.message ?? String(err)}`);
           }
           break;
         }
@@ -2260,9 +2267,9 @@ function setupWorkerHandlers(ds: DaemonSession, worker: ChildProcess): void {
         // transient Lark failures.
         if (isLinear) {
           try {
-            await cb.linearFinalOutput?.(ds, msg);
+            await cb.linearRunEvent?.(ds, { type: 'final_response', msg });
           } catch (err: any) {
-            logger.warn(`[${t}] Linear final_output callback failed: ${err?.message ?? String(err)}`);
+            logger.warn(`[${t}] Linear final_response event failed: ${err?.message ?? String(err)}`);
           }
           ds.lastBridgeEmittedUuid = msg.lastUuid;
           logger.info(`[${t}] Linear final_output captured (${msg.content.length} chars); egress is handled outside Lark`);

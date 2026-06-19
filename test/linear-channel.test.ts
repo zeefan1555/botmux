@@ -1,5 +1,5 @@
 import { createHmac } from 'node:crypto';
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { beforeEach, afterEach, describe, expect, it, vi } from 'vitest';
@@ -8,6 +8,7 @@ import {
   buildLinearStartPrompt,
   createLinearFeedState,
   feedLinearTurn,
+  linearRepositoryCandidatesFromScanRoots,
   linearAgentSessionAnchorId,
   linearRepoSelectControlKey,
   type LinearActivityRecord,
@@ -54,6 +55,8 @@ import {
   type LinearIssueClient,
   type LinearSessionClient,
 } from '../src/core/linear-egress.js';
+import { projectLinearAwaitingInput, projectLinearRunEvent } from '../src/core/linear-run-status-projector.js';
+import { applyLinearProjectConfigToTurn, buildLinearProjectPromptContext, parseLinearProjectBotmuxConfig } from '../src/core/linear-project-config.js';
 import type { LinearRepositoryConfig } from '../src/config.js';
 
 let dataDir: string;
@@ -208,6 +211,44 @@ describe('Linear Channel fake feed loop', () => {
     expect(prompt).not.toContain('<sender');
   });
 
+  it('injects Project background into Linear prompt without treating botmux config as instructions', () => {
+    const project = {
+      id: 'project_1',
+      name: 'Linear Workbench',
+      content: [
+        '# Project Background',
+        'Use Project-level product context for every issue.',
+        '',
+        '```yaml',
+        'botmux:',
+        '  repo: should-not-enter-prompt',
+        '  repoSelection: auto',
+        '```',
+        '',
+        '<!-- botmux:workbench-summary:start -->',
+        '## Botmux Workbench Summary',
+        '- Latest run verified repo config.',
+        '<!-- botmux:workbench-summary:end -->',
+      ].join('\n'),
+    };
+
+    const prompt = buildLinearStartPrompt(turn({
+      issue: { identifier: 'ZEE-1', title: 'Linear workbench', project },
+    }), 'session_1');
+
+    expect(buildLinearProjectPromptContext(project)).toMatchObject({
+      projectId: 'project_1',
+      projectName: 'Linear Workbench',
+      background: expect.stringContaining('Use Project-level product context'),
+      workbenchSummary: expect.stringContaining('Latest run verified repo config'),
+    });
+    expect(prompt).toContain('<linear_project_context trusted="false">');
+    expect(prompt).toContain('Use Project-level product context for every issue.');
+    expect(prompt).toContain('Latest run verified repo config.');
+    expect(prompt).not.toContain('should-not-enter-prompt');
+    expect(prompt).not.toContain('repoSelection');
+  });
+
   it('injects curated WorkbenchIndex context into Linear prompt without replaying prior raw user text', async () => {
     const activeSessions = new Map();
     const state = createLinearFeedState();
@@ -291,6 +332,62 @@ describe('Linear Channel fake feed loop', () => {
     expect(getLinearPendingControl(linearRepoSelectControlKey(turn()))).toMatchObject({
       status: 'pending',
       originalTurn: expect.objectContaining({ body: 'Fix this issue', agentSessionId: 'agent_session_1' }),
+    });
+  });
+
+  it('builds Linear repo select candidates by scanning configured roots to depth 3', () => {
+    const root = mkdtempSync(join(tmpdir(), 'botmux-linear-scan-'));
+    try {
+      const repo = join(root, 'bytecode', 'zeefan', 'botmux');
+      mkdirSync(join(repo, '.git'), { recursive: true });
+      writeFileSync(join(repo, '.git', 'HEAD'), 'ref: refs/heads/main\n');
+
+      const candidates = linearRepositoryCandidatesFromScanRoots([root]);
+
+      expect(candidates).toEqual([
+        expect.objectContaining({
+          hostname: 'local',
+          repositoryFullName: 'local/botmux',
+          workingDir: repo,
+          displayName: expect.stringMatching(/^botmux/),
+        }),
+      ]);
+      expect(candidates[0]!.key).toMatch(/^local:[a-f0-9]{10}$/);
+    } finally {
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it('applies Project description botmux repo config before falling back to select', () => {
+    const candidate = repoCandidate({ displayName: 'botmux (main)', repositoryFullName: 'local/botmux' });
+    const project = {
+      id: 'project_1',
+      name: 'Linear Workbench',
+      description: 'Linear-native workbench for botmux/Codex agents',
+      content: [
+        'Project notes',
+        '```yaml',
+        'botmux:',
+        '  repo: botmux',
+        '  repoSelection: auto',
+        '```',
+      ].join('\n'),
+    };
+
+    expect(parseLinearProjectBotmuxConfig(project.description)).toBeNull();
+    expect(parseLinearProjectBotmuxConfig(project.content)).toEqual({ repo: 'botmux', repoSelection: 'auto' });
+    const result = applyLinearProjectConfigToTurn(turn({ workingDir: undefined }), project, [candidate]);
+
+    expect(result).toMatchObject({ action: 'applied' });
+    if (result.action !== 'applied') throw new Error('expected project config to apply');
+    expect(result.turn.workingDir).toBe(workingDir);
+    expect(result.turn.promptContext).toMatchObject({
+      linearProjectConfig: {
+        projectId: 'project_1',
+        projectName: 'Linear Workbench',
+        selectedRepositoryKey: 'botmux',
+        repositoryFullName: 'local/botmux',
+      },
     });
   });
 
@@ -1091,6 +1188,9 @@ describe('Linear egress', () => {
         commentCalls.push(input);
         return { id: `comment_${commentCalls.length}` };
       },
+      async getIssueProject() {
+        return null;
+      },
       async createAgentSessionOnIssue(input) {
         sessionIssueCalls.push(input);
         return { id: `agent_session_issue_${sessionIssueCalls.length}`, url: 'https://linear.app/test/agent-session/issue' };
@@ -1176,6 +1276,96 @@ describe('Linear egress', () => {
     expect(await emitter.error(ds, 'Worker failed', 'turn_4')).toMatchObject({ ok: true, action: 'delivered' });
 
     expect(client.calls.map(call => call.content.type)).toEqual(['thought', 'response', 'error']);
+  });
+
+  it('projects Linear run events through the status projector', async () => {
+    const ds = egressSession();
+    const client = fakeClient();
+    const clientForSession = vi.fn(async () => client);
+
+    await expect(projectLinearRunEvent(ds, { type: 'accepted' }, { clientForSession }))
+      .resolves.toMatchObject({ ok: true, action: 'delivered' });
+    await expect(projectLinearRunEvent(ds, { type: 'worker_ready' }, { clientForSession }))
+      .resolves.toMatchObject({ ok: true, action: 'delivered' });
+    await expect(projectLinearRunEvent(ds, { type: 'status_update', body: 'Reading code', key: 'phase:read-code' }, { clientForSession }))
+      .resolves.toMatchObject({ ok: true, action: 'delivered' });
+    await expect(projectLinearRunEvent(ds, {
+      type: 'final_response',
+      msg: { type: 'final_output', content: 'Final answer', lastUuid: 'uuid_5', turnId: 'turn_5' },
+    }, { clientForSession })).resolves.toMatchObject({ ok: true, action: 'delivered' });
+    await expect(projectLinearRunEvent(ds, { type: 'error', message: 'Worker failed', turnKey: 'turn_6' }, { clientForSession }))
+      .resolves.toMatchObject({ ok: true, action: 'delivered' });
+
+    expect(client.calls.map(call => call.content)).toEqual([
+      { type: 'thought', body: 'Accepted. Starting Codex.' },
+      { type: 'thought', body: 'Codex started. Terminal is ready.' },
+      { type: 'thought', body: 'Reading code' },
+      { type: 'response', body: 'Final answer' },
+      { type: 'error', body: 'Worker failed' },
+    ]);
+    expect(client.externalUrlCalls).toHaveLength(0);
+  });
+
+  it('adds safe read-only externalUrls when the Linear worker becomes ready', async () => {
+    process.env.LINEAR_PUBLIC_TERMINAL_BASE_URL = 'https://terminal.example.com';
+    const ds = egressSession();
+    const client = fakeClient();
+
+    await expect(projectLinearRunEvent(ds, { type: 'worker_ready' }, { clientForSession: async () => client }))
+      .resolves.toMatchObject({ ok: true, action: 'delivered' });
+
+    expect(client.calls[0]?.content).toEqual({
+      type: 'thought',
+      body: 'Codex started. Terminal is ready.',
+    });
+    expect(client.externalUrlCalls).toEqual([
+      {
+        agentSessionId: 'agent_session_1',
+        externalUrls: [
+          { label: 'Read-only terminal', url: 'https://terminal.example.com/s/session_egress' },
+        ],
+      },
+    ]);
+  });
+
+  it('projects awaiting-input elicitation outside daemon route logic', async () => {
+    const client = fakeClient();
+    const clientForIdentity = vi.fn(async () => client);
+    const control = createLinearPendingControl({
+      key: linearPendingControlKey({
+        organizationId: 'org_1',
+        issueId: 'issue_1',
+        agentSessionId: 'agent_session_1',
+        kind: 'choice',
+        controlKey: 'repo_select',
+      }),
+      kind: 'choice',
+      scope: 'run',
+      organizationId: 'org_1',
+      issueId: 'issue_1',
+      agentSessionId: 'agent_session_1',
+      controlKey: 'repo_select',
+      question: 'Select repository',
+      options: [{ value: 'botmux', label: 'botmux' }],
+    });
+
+    await expect(projectLinearAwaitingInput({
+      organizationId: 'org_1',
+      channelIdentity: 'linear:codex',
+      agentSessionId: 'agent_session_1',
+      control,
+    }, { clientForIdentity })).resolves.toMatchObject({ ok: true, action: 'delivered' });
+
+    expect(clientForIdentity).toHaveBeenCalledWith({
+      organizationId: 'org_1',
+      channelIdentity: 'linear:codex',
+    });
+    expect(client.calls).toHaveLength(1);
+    expect(client.calls[0]).toMatchObject({
+      agentSessionId: 'agent_session_1',
+      content: { type: 'elicitation', body: 'Select repository' },
+      signal: 'select',
+    });
   });
 
   it('delivers select elicitation with options and a stable delivery key', async () => {
