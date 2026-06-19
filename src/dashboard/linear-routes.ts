@@ -146,9 +146,18 @@ function routeConfig(env: NodeJS.ProcessEnv, fallbackRedirectUri: string): { ok:
       redirectUri: env.LINEAR_REDIRECT_URI ?? fallbackRedirectUri,
       channelIdentity: env.LINEAR_CHANNEL_IDENTITY ?? `linear:${clientId}`,
       runtimeBotId,
-      workingDir: env.LINEAR_WORKING_DIR,
+      workingDir: linearWorkingDirSelectionEnabled(env) ? undefined : env.LINEAR_WORKING_DIR,
     },
   };
+}
+
+function linearWorkingDirSelectionEnabled(env: NodeJS.ProcessEnv): boolean {
+  const flag = (env.LINEAR_WORKING_DIR_SELECT ?? '').toLowerCase();
+  return env.LINEAR_WORKING_DIR_MODE?.toLowerCase() === 'select'
+    || flag === '1'
+    || flag === 'true'
+    || flag === 'yes'
+    || flag === 'on';
 }
 
 async function resumeAfterOAuthIfPossible(

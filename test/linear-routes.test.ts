@@ -49,6 +49,9 @@ beforeEach(() => {
 afterEach(async () => {
   if (server) await new Promise<void>(resolve => server!.close(() => resolve()));
   server = null;
+  env.LINEAR_WORKING_DIR = '/tmp';
+  delete env.LINEAR_WORKING_DIR_MODE;
+  delete env.LINEAR_WORKING_DIR_SELECT;
   if (prevDataDir === undefined) delete process.env.SESSION_DATA_DIR;
   else process.env.SESSION_DATA_DIR = prevDataDir;
   rmSync(dataDir, { recursive: true, force: true });
@@ -194,6 +197,34 @@ describe('Linear dashboard routes', () => {
       body: 'Start work',
       workingDir: '/tmp',
     });
+  });
+
+  it('omits direct workingDir in selection mode so daemon can ask for a repo before Codex starts', async () => {
+    env.LINEAR_WORKING_DIR_MODE = 'select';
+    env.LINEAR_WORKING_DIR = '/tmp/scan-root';
+    const proxyToDaemon = vi.fn(async () => new Response(JSON.stringify({ ok: true, action: 'awaiting_input' }), { status: 200 }));
+    await startLinearServer({ proxyToDaemon });
+    const raw = JSON.stringify({
+      webhookTimestamp: Date.now(),
+      organizationId: 'org_1',
+      action: 'created',
+      agentSession: {
+        id: 'agent_session_1',
+        comment: { body: 'Start work' },
+        issue: { id: 'issue_1', identifier: 'ZEE-1', title: 'Workbench' },
+      },
+    });
+    const signature = createHmac('sha256', env.LINEAR_WEBHOOK_SECRET!).update(raw).digest('hex');
+
+    const response = await fetch(`${baseUrl}/linear/webhook`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'linear-signature': signature, 'linear-delivery': 'delivery_select' },
+      body: raw,
+    });
+
+    expect(response.status).toBe(200);
+    const body = JSON.parse(proxyToDaemon.mock.calls[0][2].body);
+    expect(body.turn.workingDir).toBeUndefined();
   });
 
   it('allows Linear webhook retries after a failed daemon proxy attempt', async () => {

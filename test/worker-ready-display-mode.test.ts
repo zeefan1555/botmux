@@ -164,12 +164,15 @@ function flush(): Promise<void> {
 
 describe('Worker ready: set_display_mode re-sync', () => {
   let sessionReplyMock: ReturnType<typeof vi.fn>;
+  let linearRunEventMock: ReturnType<typeof vi.fn>;
 
   beforeEach(() => {
     vi.clearAllMocks();
     sessionReplyMock = vi.fn(async () => 'om_new_card');
+    linearRunEventMock = vi.fn(async () => {});
     initWorkerPool({
       sessionReply: sessionReplyMock,
+      linearRunEvent: linearRunEventMock,
       getSessionWorkingDir: () => '/tmp',
       getActiveCount: () => 1,
       closeSession: vi.fn(),
@@ -360,5 +363,31 @@ describe('Worker ready: set_display_mode re-sync', () => {
     fakeWorker.emit('message', { type: 'prompt_ready' });
     await flush();
     expect(fakeWorker.send).not.toHaveBeenCalled();
+  });
+
+  it('Linear ready publishes worker-ready status without creating a Lark card', async () => {
+    const fakeWorker = makeFakeWorker();
+    const ds = makeDs({
+      channel: 'linear',
+      channelIdentity: 'linear:codex-local',
+      runtimeBotId: 'app_test',
+      linear: { organizationId: 'org_1', issueId: 'issue_1', agentSessionId: 'as_1' },
+      session: {
+        ...makeDs().session,
+        channel: 'linear',
+        channelIdentity: 'linear:codex-local',
+        runtimeBotId: 'app_test',
+        linear: { organizationId: 'org_1', issueId: 'issue_1', agentSessionId: 'as_1' },
+      },
+      worker: fakeWorker,
+    } as Partial<DaemonSession>);
+
+    __testOnly_setupWorkerHandlers(ds, fakeWorker);
+    fakeWorker.emit('message', { type: 'ready', port: 9999, token: 'tok_abc' });
+    await flush();
+
+    expect(linearRunEventMock).toHaveBeenCalledWith(ds, { type: 'worker_ready' });
+    expect(sessionReplyMock).not.toHaveBeenCalled();
+    expect(updateMessageMock).not.toHaveBeenCalled();
   });
 });

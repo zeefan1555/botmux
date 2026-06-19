@@ -1,5 +1,8 @@
+import { createHash } from 'node:crypto';
 import * as sessionStore from '../services/session-store.js';
 import { config, type LinearRepositoryConfig } from '../config.js';
+import { repoPickerScanOptions } from '../global-config.js';
+import { scanMultipleProjects, type ProjectInfo } from '../services/project-scanner.js';
 import {
   consumeLinearPendingControl,
   createLinearPendingControl,
@@ -11,7 +14,8 @@ import {
   type LinearWorkbenchIndex,
 } from '../services/linear-state.js';
 import type { DaemonToWorker } from '../types.js';
-import { validateWorkingDir } from './working-dir.js';
+import { buildLinearProjectPromptContext } from './linear-project-config.js';
+import { expandHome, validateWorkingDir } from './working-dir.js';
 import { sessionKeyFor, type DaemonSession } from './types.js';
 
 export type LinearTurnType = 'created' | 'prompted' | 'stop';
@@ -32,6 +36,12 @@ export interface LinearFeedTurn {
     identifier?: string;
     title?: string;
     description?: string;
+    project?: {
+      id?: string;
+      name?: string;
+      content?: string;
+      description?: string;
+    };
   };
   workingDir?: string;
   control?: { kind: 'repo_select'; selectedValue?: string };
@@ -93,6 +103,26 @@ export function linearRepoSelectControlKey(turn: Pick<LinearFeedTurn, 'organizat
     kind: 'choice',
     controlKey: 'repo_select',
   });
+}
+
+export function linearRepositoryCandidates(
+  explicit = config.linear.repositories,
+  scanRoots = config.linear.repositoryScanRoots,
+): LinearRepositoryConfig[] {
+  const candidates = [...explicit, ...linearRepositoryCandidatesFromScanRoots(scanRoots)];
+  const seen = new Set<string>();
+  return candidates.filter(candidate => {
+    const key = `${candidate.key}:${candidate.workingDir}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+}
+
+export function linearRepositoryCandidatesFromScanRoots(scanRoots: string[]): LinearRepositoryConfig[] {
+  if (!scanRoots.length) return [];
+  return scanMultipleProjects(scanRoots.map(expandHome), 3, repoPickerScanOptions())
+    .map(projectToLinearRepositoryConfig);
 }
 
 export function buildLinearStartPrompt(turn: LinearFeedTurn, sessionId: string): string {
@@ -350,6 +380,19 @@ function validLinearRepositoryCandidates(candidates: LinearRepositoryConfig[]): 
   return valid;
 }
 
+function projectToLinearRepositoryConfig(project: ProjectInfo): LinearRepositoryConfig {
+  const suffix = createHash('sha1').update(project.path).digest('hex').slice(0, 10);
+  const branch = project.branch && project.branch !== 'unknown' ? ` (${project.branch})` : '';
+  return {
+    key: `local:${suffix}`,
+    hostname: 'local',
+    repositoryFullName: `local/${project.name}`,
+    workingDir: project.path,
+    displayName: `${project.name}${branch}`,
+    branch: project.branch,
+  };
+}
+
 function persistableTurn(turn: LinearFeedTurn): LinearFeedTurn {
   return {
     type: turn.type,
@@ -461,6 +504,7 @@ function buildLinearPrompt(kind: 'start' | 'follow_up', turn: LinearFeedTurn, se
     description: turn.issue?.description,
   };
   const workbench = linearPromptWorkbenchContext(turn);
+  const projectContext = buildLinearProjectPromptContext(turn.issue?.project);
   return [
     `<session_id>${xmlEscape(sessionId)}</session_id>`,
     '<linear_channel_contract>',
@@ -485,6 +529,11 @@ function buildLinearPrompt(kind: 'start' | 'follow_up', turn: LinearFeedTurn, se
     JSON.stringify(turn.promptContext ?? null, null, 2),
     '```',
     '</prompt_context>',
+    '<linear_project_context trusted="false">',
+    '```json',
+    JSON.stringify(projectContext, null, 2),
+    '```',
+    '</linear_project_context>',
     '<workbench_context trusted="true">',
     '```json',
     JSON.stringify(workbench, null, 2),

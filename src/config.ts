@@ -93,6 +93,19 @@ function readLinearAgentRoster(raw = process.env.LINEAR_AGENT_ROSTER_JSON): Line
   }
 }
 
+function envFlag(value: string | undefined): boolean {
+  return ['1', 'true', 'yes', 'on'].includes((value ?? '').toLowerCase());
+}
+
+function readPathList(raw: string | undefined): string[] {
+  return (raw ?? '').split(',').map(s => s.trim()).filter(Boolean);
+}
+
+function linearWorkingDirSelectionEnabled(env = process.env): boolean {
+  return env.LINEAR_WORKING_DIR_MODE?.toLowerCase() === 'select'
+    || envFlag(env.LINEAR_WORKING_DIR_SELECT);
+}
+
 // Computed once: the packaged fallback data dir. The effective dir is read
 // lazily (getter below) so that a SESSION_DATA_DIR set *after* this module is
 // first imported — e.g. cli.ts subcommands doing
@@ -181,6 +194,14 @@ export const config = {
      *  Kept separate from publicBaseUrl because dashboard and terminal proxy may
      *  be exposed by different tunnels/ports. */
     get publicTerminalBaseUrl() { return process.env.LINEAR_PUBLIC_TERMINAL_BASE_URL ?? ''; },
+    get workingDirSelectionEnabled() { return linearWorkingDirSelectionEnabled(); },
+    get repositoryScanRoots() {
+      return readPathList(
+        process.env.LINEAR_REPOSITORY_SCAN_ROOTS
+        ?? process.env.LINEAR_REPO_SCAN_ROOTS
+        ?? (linearWorkingDirSelectionEnabled() ? process.env.LINEAR_WORKING_DIR : ''),
+      );
+    },
     get repositories() { return readLinearRepositories(); },
     get agents() { return readLinearAgentRoster(); },
     get issueSideEffects() {

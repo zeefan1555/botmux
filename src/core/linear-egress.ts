@@ -49,6 +49,7 @@ export interface LinearSessionClient {
 export interface LinearIssueClient {
   updateIssue(input: { issueId: string; stateId?: string; delegateId?: string }): Promise<void>;
   createIssueComment(input: { issueId: string; body: string }): Promise<{ id?: string }>;
+  getIssueProject(input: { issueId: string }): Promise<{ id?: string; name?: string; content?: string; description?: string } | null>;
 }
 
 export interface LinearAgentSessionClient {
@@ -218,6 +219,27 @@ export function createLinearGraphqlActivityClient(accessToken: string, fetchImpl
       const body = await res.json() as { data?: { commentCreate?: { comment?: { id?: string } } }; errors?: Array<{ message?: string }> };
       if (body.errors?.length) throw new Error(body.errors.map(e => e.message).filter(Boolean).join('; ') || 'Linear comment create failed');
       return { id: body.data?.commentCreate?.comment?.id };
+    },
+    async getIssueProject(input) {
+      const res = await fetchImpl('https://api.linear.app/graphql', {
+        method: 'POST',
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          query: `query BotmuxIssueProject($issueId: String!) {
+            issue(id: $issueId) {
+              project { id name content description }
+            }
+          }`,
+          variables: { issueId: input.issueId },
+        }),
+      });
+      if (!res.ok) throw new Error(`Linear issue project query failed: ${res.status}`);
+      const body = await res.json() as { data?: { issue?: { project?: { id?: string; name?: string; content?: string; description?: string } | null } }; errors?: Array<{ message?: string }> };
+      if (body.errors?.length) throw new Error(body.errors.map(e => e.message).filter(Boolean).join('; ') || 'Linear issue project query failed');
+      return body.data?.issue?.project ?? null;
     },
     async createAgentSessionOnIssue(input) {
       const res = await fetchImpl('https://api.linear.app/graphql', {
