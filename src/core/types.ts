@@ -32,6 +32,10 @@ export interface DaemonSession {
   worker: ChildProcess | null;   // fork'd worker process
   workerPort: number | null;     // HTTP port for xterm.js
   workerToken: string | null;    // write token for xterm.js
+  channel?: Session['channel'];
+  channelIdentity?: string;
+  runtimeBotId?: string;
+  linear?: Session['linear'];
   larkAppId: string;
   chatId: string;
   chatType: 'group' | 'p2p';    // p2p chats need reply_in_thread to create topics
@@ -165,7 +169,11 @@ export interface DaemonSession {
  *  Lark message ids start with `om_` and chat ids with `oc_`, so collisions
  *  between the two address spaces are not possible. */
 export function sessionKey(anchorId: string, larkAppId: string): string {
-  return `${anchorId}::${larkAppId}`;
+  return sessionKeyFor(anchorId, larkAppId);
+}
+
+export function sessionKeyFor(anchorId: string, channelIdentity: string): string {
+  return `${anchorId}::${channelIdentity}`;
 }
 
 /** Resolve the routing anchor for an active session — chatId for chat-scope
@@ -173,4 +181,24 @@ export function sessionKey(anchorId: string, larkAppId: string): string {
  *  storage and lookup time. */
 export function sessionAnchorId(ds: DaemonSession): string {
   return ds.scope === 'chat' ? ds.chatId : ds.session.rootMessageId;
+}
+
+export function channelAnchorId(ds: DaemonSession): string {
+  if (ds.channel === 'linear' && ds.linear?.agentSessionId) {
+    return `linear:agent-session:${ds.linear.agentSessionId}`;
+  }
+  if (ds.channel === 'linear' && ds.linear?.issueId) {
+    return `linear:issue:${ds.linear.issueId}`;
+  }
+  return sessionAnchorId(ds);
+}
+
+export function channelIdentityForSession(ds: DaemonSession): string {
+  return ds.channel === 'linear'
+    ? ds.channelIdentity ?? ds.runtimeBotId ?? ds.larkAppId
+    : ds.larkAppId;
+}
+
+export function activeSessionKey(ds: DaemonSession): string {
+  return sessionKeyFor(channelAnchorId(ds), channelIdentityForSession(ds));
 }

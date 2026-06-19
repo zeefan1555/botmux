@@ -95,14 +95,14 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
     } finally {
       closeSync(fd);
     }
-    const marker = JSON.stringify(botmuxSessionId).slice(1, -1);
+    const marker = JSON.stringify(`<session_id>${botmuxSessionId}</session_id>`).slice(1, -1);
     const lines = buf.toString('utf8').trimEnd().split('\n');
     for (let i = lines.length - 1; i >= 0; i--) {
       const line = lines[i]!;
       if (!line.includes(marker)) continue;
       try {
         const parsed = JSON.parse(line);
-        if (typeof parsed?.text === 'string' && parsed.text.includes(botmuxSessionId)) {
+        if (typeof parsed?.text === 'string' && parsed.text.includes(`<session_id>${botmuxSessionId}</session_id>`)) {
           const sid = readCliSessionId(parsed);
           if (sid) return sid;
         }
@@ -114,6 +114,10 @@ function latestCodexSessionForBotmuxSession(botmuxSessionId: string): string | u
     return undefined;
   }
   return undefined;
+}
+
+function shellSingleQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
 export function createCodexAdapter(pathOverride?: string): CliAdapter {
@@ -129,7 +133,10 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
 
     buildArgs({ sessionId, resume, resumeSessionId, workingDir, model, disableCliBypass }) {
       const baseArgs = [
-        ...(!disableCliBypass ? ['--dangerously-bypass-approvals-and-sandbox'] : []),
+        ...(!disableCliBypass ? [
+          '--dangerously-bypass-approvals-and-sandbox',
+          '--dangerously-bypass-hook-trust',
+        ] : []),
         '--no-alt-screen',
         '-c',
         `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`,
@@ -158,7 +165,8 @@ export function createCodexAdapter(pathOverride?: string): CliAdapter {
       // codex session id that referenced this botmux session.
       const sid = cliSessionId ?? latestCodexSessionForBotmuxSession(sessionId);
       if (!sid) return null;
-      return `codex resume ${sid}`;
+      const sessionEnv = `shell_environment_policy.set.BOTMUX_SESSION_ID=${JSON.stringify(sessionId)}`;
+      return `codex resume --dangerously-bypass-approvals-and-sandbox --dangerously-bypass-hook-trust --no-alt-screen -c ${shellSingleQuote(sessionEnv)} ${shellSingleQuote(sid)}`;
     },
 
     /** Import path: scan the rollout files under `<CODEX_HOME>/sessions` for

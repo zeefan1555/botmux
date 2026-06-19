@@ -1076,6 +1076,46 @@ botmux dispatch --title "<子项目标题>" --bot "<coder_open_id>:名字:coder"
 - 失败别硬重试同一招 ≥3 次；上报用户。
 `;
 
+const LINEAR_STATUS_SKILL = `---
+name: botmux-linear-status
+description: "在 Linear AgentSession 中汇报实时状态/思考摘要。Use when BOTMUX_CHANNEL=linear and work may take more than a short moment: reading code, editing files, running tests, waiting on tools, blocked, or switching phases. Prefer ~/.botmux/bin/botmux linear-status. Do not use in Lark; use botmux-send there."
+---
+
+# botmux-linear-status — Linear 工作状态
+
+当你运行在 Linear channel（环境变量 \`BOTMUX_CHANNEL=linear\`）并且任务会持续一段时间时，用本技能把**短状态**写成 Linear thought，让用户知道你现在在做什么。
+
+## 什么时候用
+
+- 开始处理后：说明已接收并在定位问题
+- 进入新阶段时：读代码、编辑、运行测试、等待外部工具、整理结果
+- 卡住时：说明缺什么或哪个前置条件失败
+- 长时间操作中：低频补一条状态，不要刷屏
+
+## 用法
+
+\`\`\`bash
+~/.botmux/bin/botmux linear-status "Reading the relevant Linear channel code"
+~/.botmux/bin/botmux linear-status "Editing the smallest status-helper path"
+~/.botmux/bin/botmux linear-status "Running focused tests"
+~/.botmux/bin/botmux linear-status "Blocked: missing Linear OAuth token"
+\`\`\`
+
+也可以传稳定 key 来让同一状态幂等：
+
+\`\`\`bash
+~/.botmux/bin/botmux linear-status --key phase:tests "Running focused tests"
+\`\`\`
+
+## 边界
+
+- 只写人能看懂的阶段摘要，不写隐藏推理链、逐行终端输出、stdout/stderr、截图 OCR 或 spinner
+- 不写 secret、token、账号密码、raw URL query token、未脱敏本机绝对路径
+- 不要每条命令都发状态；同一阶段一条就够
+- 最终结果仍由正常最终回复产生；本命令只负责进度 thought
+- 如果不是 Linear channel，本命令会失败；在 Lark/Feishu 中请使用 \`botmux send\`
+`;
+
 export const ASK_SKILL_NAME = 'botmux-ask';
 
 export const BUILTIN_SKILLS: SkillDef[] = [
@@ -1087,6 +1127,7 @@ export const BUILTIN_SKILLS: SkillDef[] = [
   { name: 'botmux-handoff', content: HANDOFF_SKILL },
   { name: 'botmux-workflow-create', content: WORKFLOW_CREATE_SKILL },
   { name: 'botmux-orchestrate', content: ORCHESTRATE_SKILL },
+  { name: 'botmux-linear-status', content: LINEAR_STATUS_SKILL },
 ];
 
 /** Skills that earlier botmux versions installed but no longer ship. The

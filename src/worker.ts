@@ -2914,6 +2914,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
+      severity: 'error',
       message: t('worker.submit_impossible', { cliName: cliName(), reason, preview }),
     });
     return;
@@ -2970,6 +2971,7 @@ function scheduleSubmitFailureNotify(
     send({
       type: 'user_notify',
       turnId: currentBotmuxTurnId,
+      severity: 'error',
       message: t('worker.submit_unconfirmed', { cliName: cliName(), secs: Math.round(SUBMIT_DEFERRED_RECHECK_MS / 1000), transcriptLabel, preview }),
     });
   }, SUBMIT_DEFERRED_RECHECK_MS);
@@ -3698,6 +3700,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       send({
         type: 'user_notify',
         turnId: currentBotmuxTurnId,
+        severity: 'info',
         message:
           `⚠️  历史会话（${(cfg.cliSessionId ?? cfg.originalSessionId ?? cfg.sessionId).substring(0, 16)}…）` +
           `无法恢复，已为你**新起一个干净会话**（原因：${reason}）。\n` +
@@ -3793,6 +3796,7 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
       send({
         type: 'user_notify',
         turnId: currentBotmuxTurnId,
+        severity: 'error',
         message:
           `无法启动 ${cliName()}：找不到可执行文件「${wantBin}」。\n` +
           `请在运行 botmux daemon 的这台机器上确认它已安装并在 PATH 中（自查：${probe}），然后重发消息重试。\n` +
@@ -3818,7 +3822,13 @@ function spawnCli(cfg: Extract<DaemonToWorker, { type: 'init' }>): void {
   // approver allowlist against session.owner. Missing env → exit 2.
   childEnv.BOTMUX_SESSION_ID = cfg.sessionId;
   childEnv.BOTMUX_CHAT_ID = cfg.chatId;
-  childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  childEnv.BOTMUX_CHANNEL = cfg.channel ?? 'lark';
+  if (cfg.channelIdentity) childEnv.BOTMUX_CHANNEL_IDENTITY = cfg.channelIdentity;
+  if (cfg.channel !== 'linear' && cfg.larkAppId) childEnv.BOTMUX_LARK_APP_ID = cfg.larkAppId;
+  if (cfg.channel === 'linear') {
+    if (cfg.linearIssueId) childEnv.BOTMUX_LINEAR_ISSUE_ID = cfg.linearIssueId;
+    if (cfg.linearAgentSessionId) childEnv.BOTMUX_LINEAR_AGENT_SESSION_ID = cfg.linearAgentSessionId;
+  }
   childEnv.BOTMUX_ROOT_MESSAGE_ID = cfg.rootMessageId;
   // Initial value only; long-lived panes get the latest turn via the JSON pid marker.
   if (cfg.turnId) childEnv.BOTMUX_TURN_ID = cfg.turnId;
@@ -4811,12 +4821,14 @@ process.on('message', async (raw: unknown) => {
       // their `sessionId` is synthetic (`wf-<runId>-<activityId>-...`) and
       // must not be appended to the bot's chat-session registry.  The
       // workflow's own event log is the source of truth for run state.
-      if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
+      if (msg.channel === 'linear' && msg.channelIdentity && process.env.BOTMUX_WORKFLOW !== '1') {
+        sessionStore.init(msg.channelIdentity);
+      } else if (msg.larkAppId && process.env.BOTMUX_WORKFLOW !== '1') {
         sessionStore.init(msg.larkAppId);
       }
       // Capture credentials for direct image upload from worker
-      larkAppIdForUpload = msg.larkAppId;
-      larkAppSecretForUpload = msg.larkAppSecret;
+      larkAppIdForUpload = msg.larkAppId ?? '';
+      larkAppSecretForUpload = msg.larkAppSecret ?? '';
       // brand 决定截图上传打哪个域（feishu / larksuite）。缺省 feishu。
       larkBrandForUpload = msg.brand === 'lark' ? 'lark' : 'feishu';
       // Resolve render dimensions BEFORE startScreenUpdates() — the
@@ -4955,6 +4967,20 @@ process.on('message', async (raw: unknown) => {
         // turn's markTimeMs and falsely suppress its fallback.
         sendToPty(content, msg.turnId);
       }
+      break;
+    }
+
+    case 'cancel_turn': {
+      pendingMessages.length = 0;
+      if (msg.turnId) {
+        currentBotmuxTurnId = msg.turnId;
+        writeCliPidMarker();
+      }
+      if (tmuxScrolledHalfPages > 0) exitTmuxScrollMode();
+      handleTermAction('ctrlc');
+      isPromptReady = false;
+      idleDetector?.reset();
+      log(`Cancel turn requested${msg.turnId ? ` for ${msg.turnId}` : ''}: ${msg.reason ?? 'no reason'}`);
       break;
     }
 

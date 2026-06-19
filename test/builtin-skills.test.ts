@@ -58,6 +58,20 @@ describe('built-in botmux-quoted skill', () => {
   });
 });
 
+describe('built-in botmux-linear-status skill', () => {
+  it('teaches Linear-only low-frequency status updates', () => {
+    const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-linear-status');
+    expect(skill).toBeDefined();
+    expect(skill!.content).toContain('botmux linear-status');
+    expect(skill!.content).toContain('~/.botmux/bin/botmux linear-status');
+    expect(skill!.content).toContain('BOTMUX_CHANNEL=linear');
+    expect(skill!.content).toContain('Linear thought');
+    expect(skill!.content).toContain('不要刷屏');
+    expect(skill!.content).toContain('隐藏推理链');
+    expect(skill!.content).toContain('botmux send');
+  });
+});
+
 describe('built-in botmux-workflow-create skill', () => {
   it('exists and teaches validate + current workflow binding constraints', () => {
     const skill = BUILTIN_SKILLS.find(s => s.name === 'botmux-workflow-create');
